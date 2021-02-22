@@ -43,7 +43,10 @@ CREATE TYPE public.jobstattype AS (
 	int_eaten_count bigint,
 	int_succeeded_count bigint,
 	int_running_count bigint,
-	int_max_rss bigint
+	int_max_rss bigint,
+	int_gpu_time_success bigint,
+	int_gpu_time_fail bigint,
+	int_gpu_mem_max bigint
 );
 
 
@@ -63,7 +66,10 @@ CREATE TYPE public.layerstattype AS (
 	int_eaten_count bigint,
 	int_succeeded_count bigint,
 	int_running_count bigint,
-	int_max_rss bigint
+	int_max_rss bigint,
+	int_gpu_time_success bigint,
+	int_gpu_time_fail bigint,
+	int_gpu_mem_max bigint
 );
 
 
@@ -324,13 +330,14 @@ BEGIN
   -- concatenates all tags in host_tag and sets host.str_tags
   --
   UPDATE subscription SET int_cores = 0;
+  UPDATE subscription SET int_gpus = 0;
   FOR r IN
-    SELECT proc.pk_show, alloc.pk_alloc, sum(proc.int_cores_reserved) as c
+    SELECT proc.pk_show, alloc.pk_alloc, sum(proc.int_cores_reserved) as c, sum(proc.int_gpus_reserved) as d
     FROM proc, host, alloc
     WHERE proc.pk_host = host.pk_host AND host.pk_alloc = alloc.pk_alloc
     GROUP BY proc.pk_show, alloc.pk_alloc
   LOOP
-    UPDATE subscription SET int_cores = r.c WHERE pk_alloc=r.pk_alloc AND pk_show=r.pk_show;
+    UPDATE subscription SET int_cores = r.c, int_gpus = r.d WHERE pk_alloc=r.pk_alloc AND pk_show=r.pk_show;
 
   END LOOP;
 END;
@@ -549,12 +556,12 @@ DECLARE
     t RECORD;
 BEGIN
     FOR t IN
-        SELECT pk_folder, pk_show, sum(int_cores) AS c
+        SELECT pk_folder, pk_show, sum(int_cores) AS c, sum(int_gpus) AS d
         FROM job, job_resource
         WHERE job.pk_job = job_resource.pk_job
         GROUP by pk_folder, pk_show
     LOOP
-        UPDATE folder_resource SET int_cores = t.c WHERE pk_folder = t.pk_folder;
+        UPDATE folder_resource SET int_cores = t.c, int_gpus = t.d WHERE pk_folder = t.pk_folder;
         COMMIT;
     END LOOP;
 END;
@@ -574,12 +581,12 @@ DECLARE
     t RECORD;
 BEGIN
     FOR t IN
-        SELECT pk_dept, pk_show, sum(int_cores) AS c
+        SELECT pk_dept, pk_show, sum(int_cores) AS c, sum(int_gpus) AS d
         FROM job, job_resource
         WHERE job.pk_job = job_resource.pk_job
         GROUP BY pk_dept, pk_show
     LOOP
-        UPDATE point SET int_cores = t.c WHERE pk_show = t.pk_show AND pk_dept = t.pk_dept;
+        UPDATE point SET int_cores = t.c , int_gpus = t.d WHERE pk_show = t.pk_show AND pk_dept = t.pk_dept;
     END LOOP;
 END;
 $$;
@@ -598,12 +605,12 @@ DECLARE
     t RECORD;
 BEGIN
     FOR t IN
-        SELECT proc.pk_show, host.pk_alloc, sum(int_cores_reserved) AS c
+        SELECT proc.pk_show, host.pk_alloc, sum(int_cores_reserved) AS c, sum(int_gpus_reserved) AS d
         FROM proc, host
         WHERE proc.pk_host = host.pk_host
         GROUP BY proc.pk_show, host.pk_alloc
     LOOP
-        UPDATE subscription SET int_cores = t.c WHERE pk_show = t.pk_show AND pk_alloc = t.pk_alloc;
+        UPDATE subscription SET int_cores = t.c, int_gpus = t.d WHERE pk_show = t.pk_show AND pk_alloc = t.pk_alloc;
     END LOOP;
 END;
 $$;
@@ -673,9 +680,9 @@ BEGIN
     INSERT INTO layer_mem (pk_layer_mem, pk_layer, pk_job) VALUES (NEW.pk_layer, NEW.pk_layer, NEW.pk_job);
 
     INSERT INTO layer_history
-        (pk_layer, pk_job, str_name, str_type, int_cores_min, int_mem_min, b_archived,str_services)
+        (pk_layer, pk_job, str_name, str_type, int_cores_min, int_mem_min, int_gpus_min, int_gpu_mem_min, b_archived,str_services)
     VALUES
-        (NEW.pk_layer, NEW.pk_job, NEW.str_name, NEW.str_type, NEW.int_cores_min, NEW.int_mem_min, false, NEW.str_services);
+        (NEW.pk_layer, NEW.pk_job, NEW.str_name, NEW.str_type, NEW.int_cores_min, NEW.int_mem_min, NEW.int_gpus_min, NEW.int_gpu_mem_min, false, NEW.str_services);
 
     RETURN NEW;
 END;
@@ -693,11 +700,12 @@ CREATE FUNCTION public.trigger__after_job_dept_update() RETURNS trigger
     AS $$
 DECLARE
     int_running_cores INT;
+    int_running_gpus INT;
 BEGIN
   /**
   * Handles the accounting for moving a job between departments.
   **/
-  SELECT int_cores INTO int_running_cores
+  SELECT int_cores, int_gpus INTO int_running_cores, int_running_gpus
     FROM job_resource WHERE pk_job = NEW.pk_job;
 
   IF int_running_cores > 0 THEN
@@ -705,6 +713,14 @@ BEGIN
         WHERE pk_dept = NEW.pk_dept AND pk_show = NEW.pk_show;
 
     UPDATE point SET int_cores = int_cores - int_running_cores
+        WHERE pk_dept = OLD.pk_dept AND pk_show = OLD.pk_show;
+  END IF;
+
+  IF int_running_gpus > 0 THEN
+    UPDATE point SET int_gpus = int_gpus + int_running_gpus
+        WHERE pk_dept = NEW.pk_dept AND pk_show = NEW.pk_show;
+
+    UPDATE point SET int_gpus = int_gpus - int_running_gpus
         WHERE pk_dept = OLD.pk_dept AND pk_show = OLD.pk_show;
   END IF;
 
@@ -731,13 +747,16 @@ BEGIN
     SELECT
         job_usage.int_core_time_success,
         job_usage.int_core_time_fail,
+        job_usage.int_gpu_time_success,
+        job_usage.int_gpu_time_fail,
         job_stat.int_waiting_count,
         job_stat.int_dead_count,
         job_stat.int_depend_count,
         job_stat.int_eaten_count,
         job_stat.int_succeeded_count,
         job_stat.int_running_count,
-        job_mem.int_max_rss
+        job_mem.int_max_rss,
+        job_mem.int_gpu_mem_max
     INTO
         js
     FROM
@@ -757,6 +776,8 @@ BEGIN
         pk_dept = NEW.pk_dept,
         int_core_time_success = js.int_core_time_success,
         int_core_time_fail = js.int_core_time_fail,
+        int_gpu_time_success = js.int_gpu_time_success,
+        int_gpu_time_fail = js.int_gpu_time_fail,
         int_frame_count = NEW.int_frame_count,
         int_layer_count = NEW.int_layer_count,
         int_waiting_count = js.int_waiting_count,
@@ -766,6 +787,7 @@ BEGIN
         int_succeeded_count = js.int_succeeded_count,
         int_running_count = js.int_running_count,
         int_max_rss = js.int_max_rss,
+        int_gpu_mem_max = js.int_gpu_mem_max,
         int_ts_stopped = ts
     WHERE
         pk_job = NEW.pk_job;
@@ -775,6 +797,8 @@ BEGIN
         SELECT
             layer_usage.int_core_time_success,
             layer_usage.int_core_time_fail,
+            layer_usage.int_gpu_time_success,
+            layer_usage.int_gpu_time_fail,
             layer_stat.int_total_count,
             layer_stat.int_waiting_count,
             layer_stat.int_dead_count,
@@ -782,7 +806,8 @@ BEGIN
             layer_stat.int_eaten_count,
             layer_stat.int_succeeded_count,
             layer_stat.int_running_count,
-            layer_mem.int_max_rss
+            layer_mem.int_max_rss,
+            layer_mem.int_gpu_mem_max
         INTO
             ls
         FROM
@@ -801,6 +826,8 @@ BEGIN
         SET
             int_core_time_success = ls.int_core_time_success,
             int_core_time_fail = ls.int_core_time_fail,
+            int_gpu_time_success = ls.int_gpu_time_success,
+            int_gpu_time_fail = ls.int_gpu_time_fail,
             int_frame_count = ls.int_total_count,
             int_waiting_count = ls.int_waiting_count,
             int_dead_count = ls.int_dead_count,
@@ -808,7 +835,8 @@ BEGIN
             int_eaten_count = ls.int_eaten_count,
             int_succeeded_count = ls.int_succeeded_count,
             int_running_count = ls.int_running_count,
-            int_max_rss = ls.int_max_rss
+            int_max_rss = ls.int_max_rss,
+            int_gpu_mem_max = ls.int_gpu_mem_max
         WHERE
             pk_layer = one_layer.pk_layer;
     END LOOP;
@@ -834,8 +862,9 @@ CREATE FUNCTION public.trigger__after_job_moved() RETURNS trigger
     AS $$
 DECLARE
     int_core_count INT;
+    int_gpu_count INT;
 BEGIN
-    SELECT int_cores INTO int_core_count
+    SELECT int_cores, int_gpus INTO int_core_count, int_gpu_count
     FROM job_resource WHERE pk_job = NEW.pk_job;
 
     IF int_core_count > 0 THEN
@@ -843,6 +872,14 @@ BEGIN
         WHERE pk_folder = NEW.pk_folder;
 
         UPDATE folder_resource  SET int_cores = int_cores - int_core_count
+        WHERE pk_folder = OLD.pk_folder;
+    END IF;
+
+    IF int_gpu_count > 0 THEN
+        UPDATE folder_resource SET int_gpus = int_gpus + int_gpu_count
+        WHERE pk_folder = NEW.pk_folder;
+
+        UPDATE folder_resource  SET int_gpus = int_gpus - int_gpu_count
         WHERE pk_folder = OLD.pk_folder;
     END IF;
     RETURN NULL;
@@ -900,13 +937,16 @@ BEGIN
     SELECT
         job_usage.int_core_time_success,
         job_usage.int_core_time_fail,
+        job_usage.int_gpu_time_success,
+        job_usage.int_gpu_time_fail,
         job_stat.int_waiting_count,
         job_stat.int_dead_count,
         job_stat.int_depend_count,
         job_stat.int_eaten_count,
         job_stat.int_succeeded_count,
         job_stat.int_running_count,
-        job_mem.int_max_rss
+        job_mem.int_max_rss,
+        job_mem.int_gpu_mem_max
     INTO
         js
     FROM
@@ -926,6 +966,8 @@ BEGIN
         pk_dept = OLD.pk_dept,
         int_core_time_success = js.int_core_time_success,
         int_core_time_fail = js.int_core_time_fail,
+        int_gpu_time_success = js.int_gpu_time_success,
+        int_gpu_time_fail = js.int_gpu_time_fail,
         int_frame_count = OLD.int_frame_count,
         int_layer_count = OLD.int_layer_count,
         int_waiting_count = js.int_waiting_count,
@@ -935,6 +977,7 @@ BEGIN
         int_succeeded_count = js.int_succeeded_count,
         int_running_count = js.int_running_count,
         int_max_rss = js.int_max_rss,
+        int_gpu_mem_max = js.int_gpu_mem_max,
         b_archived = true,
         int_ts_stopped = COALESCE(epoch(OLD.ts_stopped), epoch(current_timestamp))
     WHERE
@@ -970,6 +1013,8 @@ BEGIN
     SELECT
         layer_usage.int_core_time_success,
         layer_usage.int_core_time_fail,
+        layer_usage.int_gpu_time_success,
+        layer_usage.int_gpu_time_fail,
         layer_stat.int_total_count,
         layer_stat.int_waiting_count,
         layer_stat.int_dead_count,
@@ -977,7 +1022,8 @@ BEGIN
         layer_stat.int_eaten_count,
         layer_stat.int_succeeded_count,
         layer_stat.int_running_count,
-        layer_mem.int_max_rss
+        layer_mem.int_max_rss,
+        layer_mem.int_gpu_mem_max
     INTO
         js
     FROM
@@ -996,6 +1042,8 @@ BEGIN
     SET
         int_core_time_success = js.int_core_time_success,
         int_core_time_fail = js.int_core_time_fail,
+        int_gpu_time_success = js.int_gpu_time_success,
+        int_gpu_time_fail = js.int_gpu_time_fail,
         int_frame_count = js.int_total_count,
         int_waiting_count = js.int_waiting_count,
         int_dead_count = js.int_dead_count,
@@ -1004,6 +1052,7 @@ BEGIN
         int_succeeded_count = js.int_succeeded_count,
         int_running_count = js.int_running_count,
         int_max_rss = js.int_max_rss,
+        int_gpu_mem_max = js.int_gpu_mem_max,
         b_archived = true
     WHERE
         pk_layer = OLD.pk_layer;
@@ -1103,13 +1152,15 @@ BEGIN
               frame_history
           SET
               int_mem_max_used=$1,
-              int_ts_stopped=$2,
-              int_exit_status=$3,
-              int_checkpoint_count=$4
+              int_gpu_mem_max_used=$2,
+              int_ts_stopped=$3,
+              int_exit_status=$4,
+              int_checkpoint_count=$5
           WHERE
-              int_ts_stopped = 0 AND pk_frame=$5'
+              int_ts_stopped = 0 AND pk_frame=$6'
           USING
               NEW.int_mem_max_used,
+              NEW.int_gpu_mem_max_used,
               epoch(current_timestamp),
               NEW.int_exit_status,
               int_checkpoint,
@@ -1132,12 +1183,14 @@ BEGIN
             str_state,
             int_cores,
             int_mem_reserved,
+            int_gpus,
+            int_gpu_mem_reserved,
             str_host,
             int_ts_started,
             pk_alloc
          )
          VALUES
-            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)'
+            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)'
          USING NEW.pk_frame,
             NEW.pk_layer,
             NEW.pk_job,
@@ -1145,6 +1198,8 @@ BEGIN
             'RUNNING',
             NEW.int_cores,
             NEW.int_mem_reserved,
+            NEW.int_gpus,
+            NEW.int_gpu_mem_reserved,
             NEW.str_host,
             epoch(current_timestamp),
             str_pk_alloc;
@@ -1405,14 +1460,16 @@ BEGIN
       IF lr.pk_layer = OLD.pk_layer THEN
 
         UPDATE layer_resource SET
-          int_cores = int_cores - OLD.int_cores_reserved
+          int_cores = int_cores - OLD.int_cores_reserved,
+          int_gpus = int_gpus - OLD.int_gpus_reserved
         WHERE
           pk_layer = OLD.pk_layer;
 
       ELSE
 
         UPDATE layer_resource SET
-          int_cores = int_cores + NEW.int_cores_reserved
+          int_cores = int_cores + NEW.int_cores_reserved,
+          int_gpus = int_gpus + NEW.int_gpus_reserved
        WHERE
           pk_layer = NEW.pk_layer;
        END IF;
@@ -1466,6 +1523,14 @@ BEGIN
         RAISE EXCEPTION 'host local doesnt have enough idle memory';
     END IF;
 
+    IF NEW.int_gpus_idle < 0 THEN
+        RAISE EXCEPTION 'host local doesnt have enough GPU idle cores.';
+    END IF;
+
+    IF NEW.int_gpu_mem_idle < 0 THEN
+        RAISE EXCEPTION 'host local doesnt have enough GPU idle memory.';
+    END IF;
+
     RETURN NEW;
 END;
 $$;
@@ -1489,10 +1554,13 @@ BEGIN
         RAISE EXCEPTION 'unable to allocate additional memory';
     END IF;
 
-    If NEW.int_gpu_idle < 0 THEN
-        RAISE EXCEPTION 'unable to allocate additional gpu memory';
+    If NEW.int_gpus_idle < 0 THEN
+        RAISE EXCEPTION 'unable to allocate additional GPU units';
     END IF;
 
+    If NEW.int_gpu_mem_idle < 0 THEN
+        RAISE EXCEPTION 'unable to allocate additional GPU memory';
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -1540,6 +1608,9 @@ BEGIN
     **/
     IF NEW.int_cores > NEW.int_max_cores THEN
         RAISE EXCEPTION 'job has exceeded max cores';
+    END IF;
+    IF NEW.int_gpus > NEW.int_max_gpus THEN
+        RAISE EXCEPTION 'job has exceeded max GPU units';
     END IF;
     RETURN NEW;
 END;
@@ -1763,7 +1834,11 @@ CREATE TABLE public.folder (
     int_min_cores integer DEFAULT 0 NOT NULL,
     int_max_cores integer DEFAULT '-1'::integer NOT NULL,
     b_exclude_managed boolean DEFAULT false NOT NULL,
-    f_order integer DEFAULT 0 NOT NULL
+    f_order integer DEFAULT 0 NOT NULL,
+    int_job_min_gpus integer DEFAULT '-1'::integer NOT NULL,
+    int_job_max_gpus integer DEFAULT '-1'::integer NOT NULL,
+    int_min_gpus integer DEFAULT 0 NOT NULL,
+    int_max_gpus integer DEFAULT '-1'::integer NOT NULL
 );
 
 
@@ -1792,7 +1867,10 @@ CREATE TABLE public.folder_resource (
     int_cores integer DEFAULT 0 NOT NULL,
     int_max_cores integer DEFAULT '-1'::integer NOT NULL,
     int_min_cores integer DEFAULT 0 NOT NULL,
-    float_tier numeric(16,2) DEFAULT 0 NOT NULL
+    float_tier numeric(16,2) DEFAULT 0 NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_max_gpus integer DEFAULT '-1'::integer NOT NULL,
+    int_min_gpus integer DEFAULT 0 NOT NULL
 );
 
 
@@ -1826,9 +1904,13 @@ CREATE TABLE public.frame (
     int_version integer DEFAULT 0,
     str_checkpoint_state character varying(12) DEFAULT 'DISABLED'::character varying NOT NULL,
     int_checkpoint_count smallint DEFAULT 0 NOT NULL,
-    int_gpu_reserved integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_reserved bigint DEFAULT 0 NOT NULL,
     int_total_past_core_time integer DEFAULT 0 NOT NULL,
-    ts_llu timestamp(6) with time zone
+    ts_llu timestamp(6) with time zone,
+    int_gpu_mem_used bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max_used bigint DEFAULT 0 NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_total_past_gpu_time integer DEFAULT 0 NOT NULL
 );
 
 
@@ -1854,7 +1936,10 @@ CREATE TABLE public.frame_history (
     int_ts_started integer NOT NULL,
     int_ts_stopped integer DEFAULT 0 NOT NULL,
     int_checkpoint_count integer DEFAULT 0 NOT NULL,
-    dt_last_modified date NOT NULL
+    dt_last_modified date NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_reserved bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max_used bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -1931,8 +2016,10 @@ CREATE TABLE public.host (
     b_comment boolean DEFAULT false NOT NULL,
     int_thread_mode integer DEFAULT 0 NOT NULL,
     str_lock_source character varying(128),
-    int_gpu integer DEFAULT 0 NOT NULL,
-    int_gpu_idle integer DEFAULT 0 NOT NULL
+    int_gpu_mem bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_idle bigint DEFAULT 0 NOT NULL,
+    int_gpus bigint DEFAULT 0 NOT NULL,
+    int_gpus_idle bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -1950,16 +2037,18 @@ CREATE TABLE public.host_local (
     pk_host character varying(36) NOT NULL,
     ts_created timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     ts_updated timestamp(6) with time zone,
-    int_mem_max integer DEFAULT 0 NOT NULL,
-    int_mem_idle integer DEFAULT 0 NOT NULL,
+    int_mem_max bigint DEFAULT 0 NOT NULL,
+    int_mem_idle bigint DEFAULT 0 NOT NULL,
     int_cores_max integer DEFAULT 100 NOT NULL,
     int_cores_idle integer DEFAULT 100 NOT NULL,
     int_threads integer DEFAULT 1 NOT NULL,
     float_tier numeric(16,2) DEFAULT 0 NOT NULL,
     b_active boolean DEFAULT true NOT NULL,
     str_type character varying(36) NOT NULL,
-    int_gpu_idle integer DEFAULT 0 NOT NULL,
-    int_gpu_max integer DEFAULT 0 NOT NULL
+    int_gpu_mem_idle bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL,
+    int_gpus_idle integer DEFAULT 0 NOT NULL,
+    int_gpus_max integer DEFAULT 0 NOT NULL
 );
 
 
@@ -1983,8 +2072,8 @@ CREATE TABLE public.host_stat (
     ts_booted timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     str_state character varying(32) DEFAULT 'UP'::character varying NOT NULL,
     str_os character varying(12) DEFAULT 'rhel40'::character varying NOT NULL,
-    int_gpu_total integer DEFAULT 0 NOT NULL,
-    int_gpu_free integer DEFAULT 0 NOT NULL
+    int_gpu_mem_total bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_free bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2037,7 +2126,9 @@ CREATE TABLE public.job (
     int_max_cores integer DEFAULT 20000 NOT NULL,
     str_show character varying(512) DEFAULT 'none'::character varying NOT NULL,
     ts_updated timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    str_os character varying(12)
+    str_os character varying(12),
+    int_min_gpus integer DEFAULT 0 NOT NULL,
+    int_max_gpus integer DEFAULT 100000 NOT NULL
 );
 
 
@@ -2083,7 +2174,10 @@ CREATE TABLE public.job_history (
     pk_dept character varying(36) NOT NULL,
     int_ts_started integer NOT NULL,
     int_ts_stopped integer DEFAULT 0 NOT NULL,
-    dt_last_modified date NOT NULL
+    dt_last_modified date NOT NULL,
+    int_gpu_time_success bigint DEFAULT 0 NOT NULL,
+    int_gpu_time_fail bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2121,7 +2215,9 @@ CREATE TABLE public.job_local (
     str_source character varying(255) NOT NULL,
     ts_created timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     int_cores integer DEFAULT 0 NOT NULL,
-    int_max_cores integer NOT NULL
+    int_max_cores integer NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_max_gpus integer DEFAULT 0 NOT NULL
 );
 
 
@@ -2134,8 +2230,9 @@ ALTER TABLE public.job_local OWNER TO cuebot;
 CREATE TABLE public.job_mem (
     pk_job_mem character varying(36) NOT NULL,
     pk_job character varying(36) NOT NULL,
-    int_max_rss integer DEFAULT 0 NOT NULL,
-    int_max_vss integer DEFAULT 0 NOT NULL
+    int_max_rss bigint DEFAULT 0 NOT NULL,
+    int_max_vss bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2162,13 +2259,18 @@ CREATE TABLE public.job_resource (
     pk_job_resource character varying(36) NOT NULL,
     pk_job character varying(36) NOT NULL,
     int_cores bigint DEFAULT 0 NOT NULL,
-    int_max_rss integer DEFAULT 0 NOT NULL,
-    int_max_vss integer DEFAULT 0 NOT NULL,
+    int_max_rss bigint DEFAULT 0 NOT NULL,
+    int_max_vss bigint DEFAULT 0 NOT NULL,
     int_min_cores integer DEFAULT 100 NOT NULL,
     int_max_cores integer DEFAULT 10000 NOT NULL,
     float_tier numeric(16,2) DEFAULT 0 NOT NULL,
     int_priority integer DEFAULT 1 NOT NULL,
-    int_local_cores integer DEFAULT 0 NOT NULL
+    int_local_cores integer DEFAULT 0 NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_min_gpus integer DEFAULT 0 NOT NULL,
+    int_max_gpus integer DEFAULT 10 NOT NULL,
+    int_local_gpus integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2206,7 +2308,9 @@ CREATE TABLE public.job_usage (
     int_frame_fail_count integer DEFAULT 0 NOT NULL,
     int_clock_time_fail integer DEFAULT 0 NOT NULL,
     int_clock_time_high integer DEFAULT 0 NOT NULL,
-    int_clock_time_success integer DEFAULT 0 NOT NULL
+    int_clock_time_success integer DEFAULT 0 NOT NULL,
+    int_gpu_time_success bigint DEFAULT 0 NOT NULL,
+    int_gpu_time_fail bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2232,9 +2336,11 @@ CREATE TABLE public.layer (
     str_services character varying(128) DEFAULT 'default'::character varying NOT NULL,
     b_optimize boolean DEFAULT true NOT NULL,
     int_cores_max integer DEFAULT 0 NOT NULL,
-    int_gpu_min integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_min bigint DEFAULT 0 NOT NULL,
     int_timeout integer DEFAULT 0 NOT NULL,
-    int_timeout_llu integer DEFAULT 0 NOT NULL
+    int_timeout_llu integer DEFAULT 0 NOT NULL,
+    int_gpus_min bigint DEFAULT 0 NOT NULL,
+    int_gpus_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2279,7 +2385,12 @@ CREATE TABLE public.layer_history (
     int_max_rss bigint DEFAULT 0 NOT NULL,
     b_archived boolean DEFAULT false NOT NULL,
     dt_last_modified date NOT NULL,
-    str_services character varying(128)
+    str_services character varying(128),
+    int_gpus_min integer DEFAULT 0 NOT NULL,
+    int_gpu_time_success bigint DEFAULT 0 NOT NULL,
+    int_gpu_time_fail bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_min bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2327,8 +2438,9 @@ CREATE TABLE public.layer_mem (
     pk_layer_mem character varying(36) NOT NULL,
     pk_job character varying(36) NOT NULL,
     pk_layer character varying(36) NOT NULL,
-    int_max_rss integer DEFAULT 0 NOT NULL,
-    int_max_vss integer DEFAULT 0 NOT NULL
+    int_max_rss bigint DEFAULT 0 NOT NULL,
+    int_max_vss bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2357,8 +2469,10 @@ CREATE TABLE public.layer_resource (
     pk_layer character varying(36) NOT NULL,
     pk_job character varying(36) NOT NULL,
     int_cores bigint DEFAULT 0 NOT NULL,
-    int_max_rss integer DEFAULT 0 NOT NULL,
-    int_max_vss integer DEFAULT 0 NOT NULL
+    int_max_rss bigint DEFAULT 0 NOT NULL,
+    int_max_vss bigint DEFAULT 0 NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_max bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2400,7 +2514,9 @@ CREATE TABLE public.layer_usage (
     int_clock_time_fail integer DEFAULT 0 NOT NULL,
     int_clock_time_high integer DEFAULT 0 NOT NULL,
     int_clock_time_low integer DEFAULT 0 NOT NULL,
-    int_clock_time_success integer DEFAULT 0 NOT NULL
+    int_clock_time_success integer DEFAULT 0 NOT NULL,
+    int_gpu_time_success bigint DEFAULT 0 NOT NULL,
+    int_gpu_time_fail bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2464,7 +2580,9 @@ CREATE TABLE public.point (
     b_managed boolean DEFAULT false NOT NULL,
     int_min_cores integer DEFAULT 0 NOT NULL,
     float_tier numeric(16,2) DEFAULT 0 NOT NULL,
-    ts_updated timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+    ts_updated timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL,
+    int_min_gpus integer DEFAULT 0 NOT NULL
 );
 
 
@@ -2494,7 +2612,11 @@ CREATE TABLE public.proc (
     ts_ping timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     ts_booked timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     ts_dispatched timestamp(6) with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    int_gpu_reserved integer DEFAULT 0 NOT NULL
+    int_gpu_mem_reserved bigint DEFAULT 0 NOT NULL,
+    int_gpus_reserved integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_used bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_max_used bigint DEFAULT 0 NOT NULL,
+    int_gpu_mem_pre_reserved bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -2528,9 +2650,11 @@ CREATE TABLE public.service (
     int_mem_min integer NOT NULL,
     str_tags character varying(128) NOT NULL,
     int_cores_max integer DEFAULT 0 NOT NULL,
-    int_gpu_min integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_min bigint DEFAULT 0 NOT NULL,
     int_timeout integer DEFAULT 0 NOT NULL,
-    int_timeout_llu integer DEFAULT 0 NOT NULL
+    int_timeout_llu integer DEFAULT 0 NOT NULL,
+    int_gpus_min integer DEFAULT 0 NOT NULL,
+    int_gpus_max integer DEFAULT 0 NOT NULL
 );
 
 
@@ -2553,7 +2677,9 @@ CREATE TABLE public.show (
     b_booking_enabled boolean DEFAULT true NOT NULL,
     b_dispatch_enabled boolean DEFAULT true NOT NULL,
     b_active boolean DEFAULT true NOT NULL,
-    str_comment_email character varying(1024)
+    str_comment_email character varying(1024),
+    int_default_min_gpus integer DEFAULT 100 NOT NULL,
+    int_default_max_gpus integer DEFAULT 100000 NOT NULL
 );
 
 
@@ -2585,9 +2711,11 @@ CREATE TABLE public.show_service (
     int_mem_min integer NOT NULL,
     str_tags character varying(128) NOT NULL,
     int_cores_max integer DEFAULT 0 NOT NULL,
-    int_gpu_min integer DEFAULT 0 NOT NULL,
+    int_gpu_mem_min bigint DEFAULT 0 NOT NULL,
     int_timeout integer DEFAULT 0 NOT NULL,
-    int_timeout_llu integer DEFAULT 0 NOT NULL
+    int_timeout_llu integer DEFAULT 0 NOT NULL,
+    int_gpus_min integer DEFAULT 0 NOT NULL,
+    int_gpus_max integer DEFAULT 0 NOT NULL
 );
 
 
@@ -2604,7 +2732,8 @@ CREATE TABLE public.subscription (
     int_size bigint DEFAULT 0 NOT NULL,
     int_burst bigint DEFAULT 0 NOT NULL,
     int_cores integer DEFAULT 0 NOT NULL,
-    float_tier numeric(16,2) DEFAULT 0 NOT NULL
+    float_tier numeric(16,2) DEFAULT 0 NOT NULL,
+    int_gpus integer DEFAULT 0 NOT NULL
 );
 
 
@@ -2619,7 +2748,9 @@ CREATE TABLE public.task (
     pk_point character varying(36) NOT NULL,
     str_shot character varying(36) NOT NULL,
     int_min_cores integer DEFAULT 100 NOT NULL,
-    int_adjust_cores integer DEFAULT 0 NOT NULL
+    int_adjust_cores integer DEFAULT 0 NOT NULL,
+    int_min_gpus integer DEFAULT 0 NOT NULL,
+    int_adjust_gpus integer DEFAULT 0 NOT NULL
 );
 
 
@@ -2692,6 +2823,9 @@ CREATE VIEW public.v_history_frame AS
     fh.int_mem_reserved,
     fh.int_mem_max_used,
     fh.int_cores,
+    fh.int_gpu_mem_reserved,
+    fh.int_gpu_mem_max_used,
+    fh.int_gpus,
     fh.str_host,
     fh.int_exit_status,
     a.str_name AS str_alloc_name,
@@ -2724,6 +2858,8 @@ CREATE VIEW public.v_history_job AS
     jh.str_user,
     jh.int_core_time_success,
     jh.int_core_time_fail,
+    jh.int_gpu_time_success,
+    jh.int_gpu_time_fail,
     jh.int_frame_count,
     jh.int_layer_count,
     jh.int_waiting_count,
@@ -2733,6 +2869,7 @@ CREATE VIEW public.v_history_job AS
     jh.int_succeeded_count,
     jh.int_running_count,
     jh.int_max_rss,
+    jh.int_gpu_mem_max,
     jh.b_archived,
     f.str_name AS str_facility_name,
     d.str_name AS str_dept_name,
@@ -2761,8 +2898,12 @@ CREATE VIEW public.v_history_layer AS
     lh.str_type,
     lh.int_cores_min,
     lh.int_mem_min,
+    lh.int_gpus_min,
+    lh.int_gpu_mem_min,
     lh.int_core_time_success,
     lh.int_core_time_fail,
+    lh.int_gpu_time_success,
+    lh.int_gpu_time_fail,
     lh.int_frame_count,
     lh.int_layer_count,
     lh.int_waiting_count,
@@ -2772,6 +2913,7 @@ CREATE VIEW public.v_history_layer AS
     lh.int_succeeded_count,
     lh.int_running_count,
     lh.int_max_rss,
+    lh.int_gpu_mem_max,
     lh.b_archived,
     lh.str_services,
     s.str_name AS str_show_name,
@@ -2802,6 +2944,16 @@ CREATE VIEW public.vs_alloc_usage AS
            FROM public.host h,
             public.host_stat hs
           WHERE (((h.pk_host)::text = (hs.pk_host)::text) AND ((h.pk_alloc)::text = (alloc.pk_alloc)::text) AND ((h.str_lock_state)::text = 'OPEN'::text) AND ((hs.str_state)::text = 'UP'::text))), (0)::numeric) AS int_available_cores,
+    COALESCE(sum(host.int_gpus), (0)::numeric) AS int_gpus,
+    COALESCE(sum(host.int_gpus_idle), (0)::numeric) AS int_idle_gpus,
+    COALESCE(sum((host.int_gpus - host.int_gpus_idle)), (0)::numeric) AS int_running_gpus,
+    COALESCE(( SELECT sum(host_1.int_gpus) AS sum
+           FROM public.host host_1
+          WHERE (((host_1.pk_alloc)::text = (alloc.pk_alloc)::text) AND (((host_1.str_lock_state)::text = 'NIMBY_LOCKED'::text) OR ((host_1.str_lock_state)::text = 'LOCKED'::text)))), (0)::numeric) AS int_locked_gpus,
+    COALESCE(( SELECT sum(h.int_gpus_idle) AS sum
+           FROM public.host h,
+            public.host_stat hs
+          WHERE (((h.pk_host)::text = (hs.pk_host)::text) AND ((h.pk_alloc)::text = (alloc.pk_alloc)::text) AND ((h.str_lock_state)::text = 'OPEN'::text) AND ((hs.str_state)::text = 'UP'::text))), (0)::numeric) AS int_available_gpus,
     count(host.pk_host) AS int_hosts,
     ( SELECT count(*) AS count
            FROM public.host host_1
@@ -2828,6 +2980,7 @@ CREATE VIEW public.vs_folder_counts AS
     COALESCE(sum(job_stat.int_running_count), (0)::numeric) AS int_running_count,
     COALESCE(sum(job_stat.int_dead_count), (0)::numeric) AS int_dead_count,
     COALESCE(sum(job_resource.int_cores), (0)::numeric) AS int_cores,
+    COALESCE(sum(job_resource.int_gpus), (0)::bigint) AS int_gpus,
     COALESCE(count(job.pk_job), (0)::bigint) AS int_job_count
    FROM (((public.folder
      LEFT JOIN public.job ON ((((folder.pk_folder)::text = (job.pk_folder)::text) AND ((job.str_state)::text = 'PENDING'::text))))
@@ -2846,6 +2999,7 @@ CREATE VIEW public.vs_job_resource AS
  SELECT job.pk_job,
     count(proc.pk_proc) AS int_procs,
     COALESCE(sum(proc.int_cores_reserved), (0)::numeric) AS int_cores,
+    COALESCE(sum(proc.int_gpus_reserved), (0)::bigint) AS int_gpus,
     COALESCE(sum(proc.int_mem_reserved), (0)::numeric) AS int_mem_reserved
    FROM (public.job
      LEFT JOIN public.proc ON (((proc.pk_job)::text = (job.pk_job)::text)))
@@ -2860,7 +3014,8 @@ ALTER TABLE public.vs_job_resource OWNER TO cuebot;
 
 CREATE VIEW public.vs_show_resource AS
  SELECT job.pk_show,
-    sum(job_resource.int_cores) AS int_cores
+    sum(job_resource.int_cores) AS int_cores,
+    sum(job_resource.int_gpus) AS int_gpus
    FROM public.job,
     public.job_resource
   WHERE (((job.pk_job)::text = (job_resource.pk_job)::text) AND ((job.str_state)::text = 'PENDING'::text))
@@ -3592,6 +3747,13 @@ CREATE INDEX i_folder_res_int_max_cores ON public.folder_resource USING btree (i
 
 
 --
+-- Name: i_folder_res_int_max_gpus; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_folder_res_int_max_gpus ON public.folder_resource USING btree (int_max_gpus);
+
+
+--
 -- Name: i_folder_resource_fl_tier; Type: INDEX; Schema: public; Owner: cuebot
 --
 
@@ -3676,10 +3838,10 @@ CREATE INDEX i_frame_history_ts_start_stop ON public.frame_history USING btree (
 
 
 --
--- Name: i_frame_int_gpu_reserved; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_frame_int_gpu_mem_reserved; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_frame_int_gpu_reserved ON public.frame USING btree (int_gpu_reserved);
+CREATE INDEX i_frame_int_gpu_mem_reserved ON public.frame USING btree (int_gpu_mem_reserved);
 
 
 --
@@ -3707,14 +3869,42 @@ CREATE INDEX i_frame_state_job ON public.frame USING btree (str_state, pk_job);
 -- Name: i_host_int_gpu; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_host_int_gpu ON public.host USING btree (int_gpu);
+CREATE INDEX i_host_int_gpu ON public.host USING btree (int_gpu_mem);
 
 
 --
 -- Name: i_host_int_gpu_idle; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_host_int_gpu_idle ON public.host USING btree (int_gpu_idle);
+CREATE INDEX i_host_int_gpu_idle ON public.host USING btree (int_gpu_mem_idle);
+
+
+--
+-- Name: i_host_int_gpu_mem; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_host_int_gpu_mem ON public.host USING btree (int_gpu_mem);
+
+
+--
+-- Name: i_host_int_gpu_mem_idle; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_host_int_gpu_mem_idle ON public.host USING btree (int_gpu_mem_idle);
+
+
+--
+-- Name: i_host_int_gpus; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_host_int_gpus ON public.host USING btree (int_gpus);
+
+
+--
+-- Name: i_host_int_gpus_idle; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_host_int_gpus_idle ON public.host USING btree (int_gpus_idle);
 
 
 --
@@ -3728,14 +3918,28 @@ CREATE INDEX i_host_local ON public.host_local USING btree (pk_host);
 -- Name: i_host_local_int_gpu_idle; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_host_local_int_gpu_idle ON public.host_local USING btree (int_gpu_idle);
+CREATE INDEX i_host_local_int_gpu_idle ON public.host_local USING btree (int_gpu_mem_idle);
 
 
 --
 -- Name: i_host_local_int_gpu_max; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_host_local_int_gpu_max ON public.host_local USING btree (int_gpu_max);
+CREATE INDEX i_host_local_int_gpu_max ON public.host_local USING btree (int_gpu_mem_max);
+
+
+--
+-- Name: i_host_local_int_gpus_idle; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_host_local_int_gpus_idle ON public.host_local USING btree (int_gpus_idle);
+
+
+--
+-- Name: i_host_local_int_gpus_max; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_host_local_int_gpus_max ON public.host_local USING btree (int_gpus_max);
 
 
 --
@@ -3760,17 +3964,17 @@ CREATE INDEX i_host_pkalloc ON public.host USING btree (pk_alloc);
 
 
 --
--- Name: i_host_stat_int_gpu_free; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_host_stat_int_gpu_mem_free; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_host_stat_int_gpu_free ON public.host_stat USING btree (int_gpu_free);
+CREATE INDEX i_host_stat_int_gpu_mem_free ON public.host_stat USING btree (int_gpu_mem_free);
 
 
 --
--- Name: i_host_stat_int_gpu_total; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_host_stat_int_gpu_mem_total; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_host_stat_int_gpu_total ON public.host_stat USING btree (int_gpu_total);
+CREATE INDEX i_host_stat_int_gpu_mem_total ON public.host_stat USING btree (int_gpu_mem_total);
 
 
 --
@@ -3949,10 +4153,31 @@ CREATE INDEX i_job_resource_cores ON public.job_resource USING btree (int_cores)
 
 
 --
+-- Name: i_job_resource_gpus; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_job_resource_gpus ON public.job_resource USING btree (int_gpus);
+
+
+--
+-- Name: i_job_resource_gpus_min_max; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_job_resource_gpus_min_max ON public.job_resource USING btree (int_min_gpus, int_max_gpus);
+
+
+--
 -- Name: i_job_resource_max_c; Type: INDEX; Schema: public; Owner: cuebot
 --
 
 CREATE INDEX i_job_resource_max_c ON public.job_resource USING btree (int_max_cores);
+
+
+--
+-- Name: i_job_resource_max_gpus; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_job_resource_max_gpus ON public.job_resource USING btree (int_max_gpus);
 
 
 --
@@ -4019,6 +4244,20 @@ CREATE INDEX i_layer_b_threadable ON public.layer USING btree (b_threadable);
 
 
 --
+-- Name: i_layer_cores_gpus_mem; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_layer_cores_gpus_mem ON public.layer USING btree (int_cores_min, int_gpus_min, int_mem_min, int_gpu_mem_min);
+
+
+--
+-- Name: i_layer_cores_gpus_mem_thread; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_layer_cores_gpus_mem_thread ON public.layer USING btree (int_cores_min, int_gpus_min, int_mem_min, int_gpu_mem_min, b_threadable);
+
+
+--
 -- Name: i_layer_cores_mem; Type: INDEX; Schema: public; Owner: cuebot
 --
 
@@ -4082,10 +4321,10 @@ CREATE INDEX i_layer_int_dispatch_order ON public.layer USING btree (int_dispatc
 
 
 --
--- Name: i_layer_int_gpu_min; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_layer_int_gpu_mem_min; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_layer_int_gpu_min ON public.layer USING btree (int_gpu_min);
+CREATE INDEX i_layer_int_gpu_mem_min ON public.layer USING btree (int_gpu_mem_min);
 
 
 --
@@ -4237,10 +4476,10 @@ CREATE INDEX i_point_tier ON public.point USING btree (float_tier);
 
 
 --
--- Name: i_proc_int_gpu_reserved; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_proc_int_gpu_mem_reserved; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_proc_int_gpu_reserved ON public.proc USING btree (int_gpu_reserved);
+CREATE INDEX i_proc_int_gpu_mem_reserved ON public.proc USING btree (int_gpu_mem_reserved);
 
 
 --
@@ -4286,10 +4525,17 @@ CREATE INDEX i_redirect_group ON public.redirect USING btree (str_group_id);
 
 
 --
--- Name: i_service_int_gpu_min; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_service_int_gpu_mem_min; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_service_int_gpu_min ON public.service USING btree (int_gpu_min);
+CREATE INDEX i_service_int_gpu_mem_min ON public.service USING btree (int_gpu_mem_min);
+
+
+--
+-- Name: i_service_int_gpus_min; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_service_int_gpus_min ON public.service USING btree (int_gpus_min);
 
 
 --
@@ -4307,10 +4553,17 @@ CREATE INDEX i_show_alias_pk_show ON public.show_alias USING btree (pk_show);
 
 
 --
--- Name: i_show_service_int_gpu_min; Type: INDEX; Schema: public; Owner: cuebot
+-- Name: i_show_service_int_gpu_mem_min; Type: INDEX; Schema: public; Owner: cuebot
 --
 
-CREATE INDEX i_show_service_int_gpu_min ON public.show_service USING btree (int_gpu_min);
+CREATE INDEX i_show_service_int_gpu_mem_min ON public.show_service USING btree (int_gpu_mem_min);
+
+
+--
+-- Name: i_show_service_int_gpus_min; Type: INDEX; Schema: public; Owner: cuebot
+--
+
+CREATE INDEX i_show_service_int_gpus_min ON public.show_service USING btree (int_gpus_min);
 
 
 --
@@ -4548,14 +4801,14 @@ CREATE TRIGGER upgrade_proc_memory_usage AFTER UPDATE ON public.proc FOR EACH RO
 -- Name: host_local verify_host_local; Type: TRIGGER; Schema: public; Owner: cuebot
 --
 
-CREATE TRIGGER verify_host_local BEFORE UPDATE ON public.host_local FOR EACH ROW WHEN (((new.int_cores_max = old.int_cores_max) AND (new.int_mem_max = old.int_mem_max) AND ((new.int_cores_idle <> old.int_cores_idle) OR (new.int_mem_idle <> old.int_mem_idle)))) EXECUTE FUNCTION public.trigger__verify_host_local();
+CREATE TRIGGER verify_host_local BEFORE UPDATE ON public.host_local FOR EACH ROW WHEN (((new.int_cores_max = old.int_cores_max) AND (new.int_mem_max = old.int_mem_max) AND ((new.int_cores_idle <> old.int_cores_idle) OR (new.int_mem_idle <> old.int_mem_idle)) AND ((new.int_gpus_max = old.int_gpus_max) AND (new.int_gpu_mem_max = old.int_gpu_mem_max)) AND ((new.int_gpus_idle <> old.int_gpus_idle) OR (new.int_gpu_mem_idle <> old.int_gpu_mem_idle)))) EXECUTE FUNCTION public.trigger__verify_host_local();
 
 
 --
 -- Name: host verify_host_resources; Type: TRIGGER; Schema: public; Owner: cuebot
 --
 
-CREATE TRIGGER verify_host_resources BEFORE UPDATE ON public.host FOR EACH ROW WHEN (((new.int_cores_idle <> old.int_cores_idle) OR (new.int_mem_idle <> old.int_mem_idle))) EXECUTE FUNCTION public.trigger__verify_host_resources();
+CREATE TRIGGER verify_host_resources BEFORE UPDATE ON public.host FOR EACH ROW WHEN (((new.int_cores_idle <> old.int_cores_idle) OR (new.int_mem_idle <> old.int_mem_idle) OR (new.int_gpus_idle <> old.int_gpus_idle) OR (new.int_gpu_mem_idle <> old.int_gpu_mem_idle))) EXECUTE FUNCTION public.trigger__verify_host_resources();
 
 
 --
@@ -4569,7 +4822,7 @@ CREATE TRIGGER verify_job_local BEFORE UPDATE ON public.job_local FOR EACH ROW W
 -- Name: job_resource verify_job_resources; Type: TRIGGER; Schema: public; Owner: cuebot
 --
 
-CREATE TRIGGER verify_job_resources BEFORE UPDATE ON public.job_resource FOR EACH ROW WHEN (((new.int_max_cores = old.int_max_cores) AND (new.int_cores > old.int_cores))) EXECUTE FUNCTION public.trigger__verify_job_resources();
+CREATE TRIGGER verify_job_resources BEFORE UPDATE ON public.job_resource FOR EACH ROW WHEN ((((new.int_max_cores = old.int_max_cores) AND (new.int_cores > old.int_cores)) OR ((new.int_max_gpus = old.int_max_gpus) AND (new.int_gpus > old.int_gpus)))) EXECUTE FUNCTION public.trigger__verify_job_resources();
 
 
 --
